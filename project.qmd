@@ -1,0 +1,263 @@
+---
+title: "A spatial analysis of shock responsiveness data from rural Ethiopia"
+subtitle: "Sta 344/644 - Final Project"
+format: 
+  html:
+    self-contained: true
+author:
+- Dylan Munson
+---
+
+
+## Setup
+
+```{r setup}
+library(sf)
+library(dplyr)
+library(dukestm)
+library(spdep)
+library(stars)
+library(ggplot2)
+
+flexiblas::flexiblas_load_backend("OPENBLAS-THREADS") |>
+  flexiblas::flexiblas_switch()
+flexiblas::flexiblas_set_num_threads(8)
+```
+
+## Introduction
+
+Climate change is expected to have a major impact on Ethiopia's economically important and expansive agricultural sector, especially by increasing the frequency of drought and flood events.  As an intervention designed to help farmers access sustainable irrigation technology, the Distributed Renewable Energy-Agriculture Modalities (DREAM) project has been implemented in rural parts of the country.  The project aims to provide solar minigrid-powered irrigation capacity to farmers.  As part of the intervention, a baseline survey was conducted analyzing, amongst a variety of other household characteristics, the responses which households take to different types of livelihood shocks, including natural disasters like droughts and floods.  The present study seeks to analyze the results from this module of the survey, trying to understand what factors influence a household's ability to respond to such shocks and thus what policies could be implemented to increase the resilience of rural households in Ethiopia.
+
+Preliminary regression results seem to indicate that there is a strong social component to responsiveness, that is, that local support networks may be important in allowing households to respond to shocks.  To provide further evidence of the significance of such factors in a descriptive way, this portion of the project will try to determine whether there are indeed local spatial components to responsiveness and if so at what scale they operate.  If it is found that there are local spatial effects, this could be further evidence that support networks (which in Ethiopia are highly localized in nature) are important in determining responsiveness.
+
+I first conduct exploratory data analysis to try to understand the nature of any spatial structure in the data, looking at semivariograms and computing Moran's I to test if spatial autocorrelation is present.  I then fit a latent GLM Gaussian process model of the form:
+
+$$
+\begin{align*}
+r(s) &\sim \text{Binom}(p(s),n(s)) \\ 
+\log\Bigl(\frac{p(s)}{1-p(s)}\Bigr) &= \beta_0 + w(s) \\
+w(s) &\sim \mathcal{N}(0,\mathbf{\Sigma}) \\
+\{\mathbf{\Sigma}\}_{ij} &= \sigma^2\exp (-d\phi) \\
+\end{align*}
+$$
+where $r(s)$ is the number of shocks responded to by the household and $n(s)$ is the number of shocks that they experience (note that only households which experience at least 1 shock are included in this analysis, so some degree of censoring is present).  The main parameter of interest for our purposes is $\phi$, the inverse lengthscale parameter, the estimate of which I use to back out the effective range of the scale of responsiveness.  Finally, a predictive surface for a small portion of the survey area is generated, although it should be noted that the predictive capabilities of the model are not of great interest here.
+
+## Methods / Implementation
+
+I first read in the already-cleaned (for previous analysis) survey data.  Separate shock modules were conducted for each of the three cropping seasons in Ethiopia, so first the data is separated into different dataframes for each of these seasons.  The analysis we conduct will look at the *meher* season, which is the main cropping season in the country (and also has the greatest number of observations).
+
+```{r}
+sites <- read.csv('~/project-dylan_munson/input_data/data_for_regs.csv') %>%
+  st_as_sf(., coords = c("longitude","latitude"), crs = 4326) %>%
+  st_transform(., crs = "ESRI:102023") #reproject into Africa Equidistant Conic
+sites$eastwest <- as.double(st_coordinates(sites)[,1])
+sites$northsouth <- as.double(st_coordinates(sites)[,2])
+
+#filter to separate into the different cropping seasons
+sites_meher <- filter(sites, season_str == "Meher")
+sites_dry <- filter(sites, season_str == "Dry")
+sites_belg <- filter(sites, season_str == "Belg")
+
+#clean meher data for GP
+df <- sites_meher %>%
+  filter(!is.na(number_of_shocks) & !is.na(post_number_responded)) %>%
+  select(HHID, post_number_responded, number_of_shocks, kebele, eastwest, northsouth)
+coordinates <- df %>%
+  select(eastwest,northsouth) %>%
+  st_drop_geometry() %>%
+  as.matrix()
+```
+
+I now compute Moran's I (with the weight matrix determined by distances between points) for the number of shocks responded to by the household, the number of shocks experienced, and the proportion of shocks responded to, to test for spatial autocorrelation.  I also look at both directional and non-directional semivariograms for the data.
+
+```{r, warning = FALSE}
+#Moran's I
+df$prop_responded <- df$post_number_responded/df$number_of_shocks
+distmat <- as.matrix(dist(as.matrix(df$eastwest,df$northsouth), method = "euclidean")) #distance matrix
+invdistmat <- 1/distmat #use inverse distances as weights
+diag(invdistmat) <- 0
+listW <- mat2listw(invdistmat, style = "W") #take 1/weight matrix so that closer points receive higher weights
+spdep::moran.test(df$post_number_responded, listW)
+spdep::moran.test(df$number_of_shocks, listW)
+spdep::moran.test(df$prop_responded, listW)
+
+#basic semivariogram
+variog <- geoR::variog(coords = coordinates, data = df$post_number_responded, max.dist = 10000, messages = FALSE)
+png('~/project-dylan_munson/output/plots_tables/variog.png')
+plot(variog, xlab = "Distance (m)", ylab = "Semivariance")
+figure <- dev.off()
+plot(variog, xlab = "Distance (m)", ylab = "Semivariance") #display plot
+
+#check for isotropy
+variog_iso <- geoR::variog4(coords = coordinates, data = df$post_number_responded, max.dist = 10000, messages = FALSE)
+png('~/project-dylan_munson/output/plots_tables/variog_iso.png')
+plot(variog_iso, xlab = "Distance (m)", ylab = "Semivariance")
+figure <- dev.off()  
+plot(variog_iso, xlab = "Distance (m)", ylab = "Semivariance") #display plot
+```
+
+The result of the Moran's I test seems to suggest that there is spatial autocorrelation present for all three variables, so further analysis seems warranted.  On the other hand, the non-directional semivariogram shows very little structure, except for perhaps two "hills."  The directional semivariogram does not raise too many concerns regarding anisotropy (one of the lines is broken due to the introduction of NAs, presumably because of a lack of data at that distance and in that direction), so I proceed (somewhat cautiously) and fit the Gaussian process model next.
+
+```{r, eval = FALSE}
+m_response_meher <- gpglm(
+  post_number_responded ~ 1,
+  data = df %>% st_drop_geometry(), family = "binomial", weights = df$number_of_shocks,
+  coords = c("eastwest","northsouth"),
+  cov_model = "exponential",
+  starting = list( 
+    beta = 0,
+    phi=3/5000, sigma.sq=5, w=0
+  ),
+  priors = list(
+    beta.Normal = list(0,1),
+    phi.unif=c(3/20000, 3/100), sigma.sq.ig=c(0.1, 0.1)
+  ),
+  tuning = list(
+    beta = 0.1,
+    "phi"=0.6, "sigma.sq"=0.3, "w"=0.1
+  ),
+  burnin_frac = 0.5,
+  n_batch = 400,
+  batch_len = 250,
+  verbose = FALSE,
+  n_report = 10,
+  chains = 4
+)
+
+save(m_response_meher, file = '~/project-dylan_munson/output/meher_response_model.Rdata')
+rm(m_response_meher)
+```
+
+```{r}
+load(file = '~/project-dylan_munson/output/meher_response_model.Rdata')
+png('~/project-dylan_munson/output/plots_tables/model_diag.png')
+plot(m_response_meher)
+figure <- dev.off()
+plot(m_response_meher) #display plot
+
+#manually calculate ESS values using stan function to safely account for burn-in
+burn_in_prop <- 0.5
+nchains <- 4
+ndraws <- as.double(nrow(m_response_meher[["models"]][[1]][["mcmc"]]))
+total_bulk_ess <- 0 #initalize bulk ess
+total_tail_ess <- 0 #initalize tail ess
+
+for (i in 1:nchains) {
+  chain_ess <- rstan::ess_bulk(m_response_meher[["models"]][[i]][["mcmc"]][floor(burn_in_prop*ndraws):ndraws,3])
+  total_bulk_ess <- total_bulk_ess + chain_ess
+}
+print(paste0("Manually Calculated Bulk ESS, Phi: ",total_bulk_ess))
+
+for (i in 1:nchains) {
+  chain_ess <- rstan::ess_tail(m_response_meher[["models"]][[i]][["mcmc"]][floor(burn_in_prop*ndraws):ndraws,3])
+  total_tail_ess <- total_tail_ess + chain_ess
+}
+print(paste0("Manually Calculated Tail ESS, Phi: ",total_tail_ess))
+m_response_meher
+```
+
+While neither the automatically calculated or manually calculated (to make sure burn-in is properly accounted for) ESS values are great, they seem satisfactory for a model that is already quite hard to fit.  Additionally, the R-hat statistics seem fine and although the trace plots of the chains show a large degree of autocorrelation, they seem to have converged and mixed decently well.  I now analyze the distribution of the effective range based on the posterior draws of $\phi$.  Finally, predictions are conducted for a small region in northern Ethiopia near Lake Tana, consisting of two *woredas* (small administrative subdivisions) which contain several village clusters where the survey was conducted.  The predictive surface of the GP is visualized as a surface mapping the probability associated with a successful response to a shock (we do not portray the number of shocks responded to as the binomial denominator has no specified value for non-surveyed cells).  Darker regions are associated with a lower probability of "successful response," and the red points are survey sites.  Although prediction is not the goal of this exercise, I do test for remaining spatial autocorrelation in the residuals for this northern region and calculate its associated RMSE.
+
+```{r}
+#calculate distribution of effective range from draws of phi
+param_draws <- as.data.frame(m_response_meher[["models"]][[1]][["mcmc"]]) #use only chain 1
+param_draws$effective_range <- (3/param_draws$phi)/1000 #divide everything by 1000 to convert to kilometers
+png('~/project-dylan_munson/output/plots_tables/effective_range_density.png')
+plot(density(param_draws$effective_range), main = "Effective Range (km)")
+figure <- dev.off()
+plot(density(param_draws$effective_range), main = "Effective Range (km)") #display plot
+er_mean <- mean(param_draws$effective_range)
+er_median <- median(param_draws$effective_range)
+er_sd <- sd(param_draws$effective_range)
+print(paste0("Effective Range: Mean=",er_mean,", Median=",er_median," Std. Dev.=",er_sd))
+
+#rasterize woredas we want to predict for
+eth_north_polygon <- read_sf('~/project-dylan_munson/input_data/Ethiopia_AdminBoundaries-shp/Ethiopia_AdminBoundaries.shp', quiet = TRUE) %>% #northern prediction area extraction
+  st_transform(., crs = "ESRI:102023") %>% #reproject into Africa Equidistant Conic
+  filter(REGIONNAME == "Amhara") %>%
+  filter(WOREDANAME == "Dera" | WOREDANAME == "Fogera") %>% #select the two woredas in northern Ethiopia we want to predict for
+  group_by(REGIONNAME) %>%
+  summarize() #take union of two woredas
+eth_north <- st_rasterize(eth_north_polygon, st_as_stars(st_bbox(eth_north_polygon), nx = 100, ny = 100)) %>%
+  as_tibble() %>%
+  filter(ID != 0) %>%
+  select(eastwest = x, northsouth = y)
+
+```
+
+```{r, eval = FALSE}
+#predictions for northern area
+p <- predict(m_response_meher, newdata = eth_north, coords = c("eastwest", "northsouth"), thin = 100, verbose = FALSE)
+save(p, file = '~/project-dylan_munson/output/predictions_north_raw.Rdata')
+rm(p)
+```
+
+```{r, warning = FALSE}
+load(file = '~/project-dylan_munson/output/predictions_north_raw.Rdata')
+preds_north <- left_join(
+  eth_north %>% 
+    mutate(i = row_number()),
+  tidybayes::gather_draws(p, y[i]) %>%
+    filter(.chain == 1) %>%
+    group_by(.chain, i) %>%
+    summarize( #summarize before doing binomial draws so that prediction means are still guaranteed to be integers
+      mean = mean(.value),
+      med = median(.value),
+      sd = sd(.value),
+      .groups = "drop"
+    ),
+  by = "i"
+)
+preds_north <- st_as_stars(preds_north) %>%
+  select(mean) %>%
+  rename("Mean Probability" = mean)
+st_crs(preds_north) <- "ESRI:102023"
+ggplot() +
+  geom_stars(data = preds_north, na.action = na.omit) +
+  geom_sf(data = st_intersection(sites_meher, eth_north_polygon), color = "red", size = 0.4, alpha = 0.1) +
+  ggtitle("Probability of Response Surface and Site Locations") +
+  xlab("") +
+  ylab("")
+ggsave(filename = '~/project-dylan_munson/output/plots_tables/predictive_surface_north.png')
+
+#sample predicted probabilities to points
+north_points <- st_extract(preds_north, st_intersection(sites_meher, eth_north_polygon)) %>%
+  st_join(., sites_meher) %>% #join to main sites data
+  rename(mean_pred_prob = "Mean Probability")
+```
+
+```{r, eval = FALSE}
+north_points$pred_number_responded <- rbinom(n = nrow(north_points), size = north_points$number_of_shocks, prob = north_points$mean_pred_prob) #binomial draws for predicting number of shocks
+save(north_points, file = '~/project-dylan_munson/output/north_prediction_points.Rdata') #save for consistency of draws
+rm(north_points)
+```
+
+```{r}
+load(file = '~/project-dylan_munson/output/north_prediction_points.Rdata')
+north_points$res <- north_points$number_of_shocks - north_points$pred_number_responded #calculate residuals
+north_points <- north_points %>%
+  filter(!is.na(res))
+
+#Moran's I for residuals
+distmat <- as.matrix(dist(as.matrix(north_points$eastwest,north_points$northsouth), method = "euclidean")) #weight matrix
+invdistmat <- 1/distmat
+diag(invdistmat) <- 0
+listW <- mat2listw(invdistmat, style = "W") #take 1/weight matrix so that closer points receive higher weights
+spdep::moran.test(north_points$res, listW)
+
+#calculate RMSE
+rmse <- north_points %>%
+  summarize(rmse = mean(sqrt(sum(number_of_shocks - pred_number_responded)^2) / n()), na.rm = TRUE)
+print(paste0("RMSE: ",rmse$rmse))
+```
+
+
+## Discussion & Conclusion
+
+Despite the mixed results from the semivariogram analysis, there do appear to be strong spatial factors at play in shock responsiveness for this set of households.  The highly significant value in the test of Moran's I indicates that spatial autocorrelation is present, as previously noted, despite mixed results from the semivariogram analysis.  In other words, households that are more (or less) able to respond to shocks seem to tend to be clustered together.
+
+The latent GP model allows us to uncover the scale at which this process occurs through estimation of the inverse lengthscale parameter $\phi$.  Using this parameter to calculate the approximate effective range for the process, we find that both the mean and median of its distribution (based on the posterior draws from the model fit) are around 3 to 3.5 km.  Perhaps unsurprisingly, this is close to a reasonable distance that someone in rural Ethiopia could walk in a day.  For this reason, it seems that the scale at which households responsiveness autocorrelates is similar to the scale at which local support networks would be likely to exist, providing some non-causal evidence for the original hypothesis.  This relatively simple model also appears to account for a large degree of the autocorrelation present in the original model, as another Moran's I test on a subset of the data for which predictions were made shows "less" spatial autocorrelation remaining compared to before (although this result is somewhat dependent on the particular binomial prediction draw).
+
+There are some limitations to the analysis conducted here.  First, as previously noted, it is non-causal in nature, and inference is difficult for this type of model.  A more complex model including more covariates could have been interesting, but would have added additional complications to model fitting.  Similarly, the GP model, even for such a small dataset, was computationally intensive to fit, and diagnostics from the model could have been better, in particular effective sample sizes.  Finally, because the original data was already highly clustered (in the villages chosen for survey sites), it is hard to ignore the possibility that the GP is simply picking up on these clusters of points, although this worry is somewhat assuaged by the fact that both relatively high and low probability clusters appear to exist in the predictive surface map.
+
+In any case, this brief project suggests that more study on the local level correlates of responsiveness to livelihood shocks in rural Ethiopia is warranted.  It is the hope of current researchers involved that a follow-up survey will be able to be conducted at least at some sites, prefereably with a module specifically asking about local network effects.  This type of survey would be a helpful addition to the analysis conducted here and would provide additional information about what small-scale resilience-related processes are at work in these communities which are at high risk from the future and current effects of anthropogenic climate change.
